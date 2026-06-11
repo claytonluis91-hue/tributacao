@@ -78,54 +78,102 @@ edited_df = st.data_editor(
     }
 )
 
+from openpyxl.styles import Font, PatternFill
+
 def gerar_excel(resultados, dados_input):
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        # Tabela Simples Nacional
+        
+        # Tabela 0: Resumo Comparativo
+        resumo_data = []
+        for r in resultados:
+            vencedor_mes = min({"Simples": r.total_sn, "Presumido": r.total_lp, "Real": r.total_lr}.items(), key=lambda x: x[1])
+            resumo_data.append({
+                "Mês": r.mes,
+                "Faturamento": r.faturamento,
+                "Total Simples Nacional": r.total_sn,
+                "Total Lucro Presumido": r.total_lp,
+                "Total Lucro Real": r.total_lr,
+                "Melhor Regime": vencedor_mes[0],
+                "Economia (Diferença para o 2º)": sorted([r.total_sn, r.total_lp, r.total_lr])[1] - vencedor_mes[1]
+            })
+        df_resumo = pd.DataFrame(resumo_data)
+        df_resumo.to_excel(writer, sheet_name="Resumo Comparativo", index=False)
+
+        # Tabela 1: Simples Nacional
         sn_data = []
         for r in resultados:
             sn_data.append({
                 "Mês": r.mes,
                 "Faturamento": r.faturamento,
                 "RBT12 Calculado": r.sn_rbt12,
-                "Fator R": r.sn_fator_r,
+                "Faixa Anexo": f"Faixa {r.sn_faixa}",
                 "Alíquota Efetiva": r.sn_aliquota_efetiva,
-                "Federal (DAS)": r.sn_federal,
-                "Consumo (DAS)": r.sn_consumo,
-                "INSS Patronal": r.sn_encargos,
+                "Valor Total DAS": r.sn_total_das,
+                "IRPJ": r.sn_valor_irpj,
+                "CSLL": r.sn_valor_csll,
+                "COFINS": r.sn_valor_cofins,
+                "PIS/Pasep": r.sn_valor_pis,
+                "CPP (INSS)": r.sn_valor_cpp,
+                "ISS": r.sn_valor_iss,
+                "INSS Extra (Folha)": r.sn_encargos - r.sn_valor_cpp,
                 "Total Mês": r.total_sn
             })
         pd.DataFrame(sn_data).to_excel(writer, sheet_name="Simples Nacional", index=False)
 
-        # Tabela Lucro Presumido
+        # Tabela 2: Lucro Presumido
         lp_data = []
         for r in resultados:
             lp_data.append({
                 "Mês": r.mes,
                 "Faturamento": r.faturamento,
                 "Base IRPJ": r.lp_base_irpj,
+                "Alíq. IRPJ/CSLL": "15% / 9%",
                 "IRPJ/CSLL Normal": r.lp_irpj_csll_normal,
-                "Adicional IRPJ (Trimestre)": r.lp_adicional_irpj,
-                "PIS/COFINS (Cumulativo)": r.lp_consumo,
+                "Adicional IRPJ (10%)": r.lp_adicional_irpj,
+                "Alíq. PIS/COFINS": "3.65%",
+                "PIS/COFINS": r.lp_consumo,
                 "INSS Patronal": r.lp_encargos,
                 "Total Mês": r.total_lp
             })
         pd.DataFrame(lp_data).to_excel(writer, sheet_name="Lucro Presumido", index=False)
 
-        # Tabela Lucro Real
+        # Tabela 3: Lucro Real
         lr_data = []
         for r in resultados:
             lr_data.append({
                 "Mês": r.mes,
                 "Faturamento": r.faturamento,
                 "LAIR": r.lr_lair,
+                "Alíq. IRPJ/CSLL": "15% / 9%",
                 "IRPJ/CSLL Normal": r.lr_irpj_csll_normal,
                 "Adicional IRPJ (>20k)": r.lr_adicional_irpj,
-                "PIS/COFINS (Não Cumulativo)": r.lr_consumo,
+                "Alíq. PIS/COFINS": "9.25% (Não Cumulativo)",
+                "PIS/COFINS Liq": r.lr_consumo,
                 "INSS Patronal": r.lr_encargos,
                 "Total Mês": r.total_lr
             })
         pd.DataFrame(lr_data).to_excel(writer, sheet_name="Lucro Real", index=False)
+        
+        # Formatando as planilhas
+        for sheet_name in writer.sheets:
+            worksheet = writer.sheets[sheet_name]
+            header_fill = PatternFill(start_color="D3D3D3", end_color="D3D3D3", fill_type="solid")
+            for cell in worksheet[1]:
+                cell.font = Font(bold=True)
+                cell.fill = header_fill
+            # Ajustar largura
+            for col in worksheet.columns:
+                max_length = 0
+                column = col[0].column_letter
+                for cell in col:
+                    try:
+                        if len(str(cell.value)) > max_length:
+                            max_length = len(str(cell.value))
+                    except:
+                        pass
+                adjusted_width = (max_length + 2)
+                worksheet.column_dimensions[column].width = adjusted_width
 
     return output.getvalue()
 

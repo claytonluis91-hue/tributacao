@@ -27,10 +27,17 @@ class ResultadoMes:
     # Detalhes SN
     sn_rbt12: float = 0.0
     sn_fator_r: float = 0.0
+    sn_faixa: int = 1
     sn_aliquota_efetiva: float = 0.0
+    sn_valor_irpj: float = 0.0
+    sn_valor_csll: float = 0.0
+    sn_valor_cofins: float = 0.0
+    sn_valor_pis: float = 0.0
+    sn_valor_cpp: float = 0.0
+    sn_valor_iss: float = 0.0
+    sn_encargos: float = 0.0
     sn_federal: float = 0.0
     sn_consumo: float = 0.0
-    sn_encargos: float = 0.0
     
     # Detalhes LP
     lp_base_irpj: float = 0.0
@@ -49,8 +56,12 @@ class ResultadoMes:
     lr_encargos: float = 0.0
 
     @property
+    def sn_total_das(self):
+        return self.sn_valor_irpj + self.sn_valor_csll + self.sn_valor_cofins + self.sn_valor_pis + self.sn_valor_cpp + self.sn_valor_iss
+
+    @property
     def total_sn(self):
-        return self.sn_federal + self.sn_consumo + self.sn_encargos
+        return self.sn_total_das + self.sn_encargos
 
     @property
     def total_lp(self):
@@ -60,7 +71,8 @@ class ResultadoMes:
     def total_lr(self):
         return self.lr_federal + self.lr_consumo + self.lr_encargos
 
-# Tabelas do Simples Nacional (Simplificadas para o exemplo - Anexo III e V)
+
+# Tabelas do Simples Nacional (Limites, Alíquota Nominal, Parcela)
 TABELA_ANEXO_III = [
     (180000, 0.06, 0),
     (360000, 0.112, 9360),
@@ -68,6 +80,14 @@ TABELA_ANEXO_III = [
     (1800000, 0.16, 35640),
     (3600000, 0.21, 125640),
     (4800000, 0.33, 648000)
+]
+REPARTICAO_ANEXO_III = [
+    (0.0400, 0.0350, 0.1282, 0.0278, 0.4340, 0.3350), # Faixa 1
+    (0.0400, 0.0350, 0.1405, 0.0305, 0.4340, 0.3200), # Faixa 2
+    (0.0400, 0.0350, 0.1364, 0.0296, 0.4340, 0.3250), # Faixa 3
+    (0.0400, 0.0350, 0.1364, 0.0296, 0.4340, 0.3250), # Faixa 4
+    (0.0400, 0.0350, 0.1282, 0.0278, 0.4340, 0.3350), # Faixa 5
+    (0.3500, 0.1500, 0.1603, 0.0347, 0.3050, 0.0000)  # Faixa 6
 ]
 
 TABELA_ANEXO_V = [
@@ -78,6 +98,14 @@ TABELA_ANEXO_V = [
     (3600000, 0.23, 62100),
     (4800000, 0.305, 540000)
 ]
+REPARTICAO_ANEXO_V = [
+    (0.0400, 0.0500, 0.1439, 0.0312, 0.2885, 0.4464), # Faixa 1
+    (0.0400, 0.0500, 0.1439, 0.0312, 0.2785, 0.4564), # Faixa 2
+    (0.0400, 0.0500, 0.1439, 0.0312, 0.2385, 0.4964), # Faixa 3
+    (0.0400, 0.0500, 0.1439, 0.0312, 0.2385, 0.4964), # Faixa 4
+    (0.0400, 0.0500, 0.1439, 0.0312, 0.2385, 0.4964), # Faixa 5
+    (0.2950, 0.1650, 0.2105, 0.0458, 0.2837, 0.0000)  # Faixa 6
+]
 
 def calcula_inss_patronal(folha: float, config: ConfigTributaria) -> float:
     cota = 0.20
@@ -85,18 +113,18 @@ def calcula_inss_patronal(folha: float, config: ConfigTributaria) -> float:
     total_aliquota = cota + rat_ajustado + config.aliquota_terceiros
     return folha * total_aliquota
 
-def get_aliquota_efetiva_simples(rbt12: float, anexo: List[Tuple[float, float, float]]) -> float:
+def get_aliquota_efetiva_simples(rbt12: float, anexo: List[Tuple[float, float, float]], reparticao: List[Tuple]) -> Tuple[float, int, Tuple]:
     if rbt12 == 0:
-        return anexo[0][1]
+        return anexo[0][1], 1, reparticao[0]
     
-    for limite, aliquota_nominal, parcela in anexo:
+    for i, (limite, aliquota_nominal, parcela) in enumerate(anexo):
         if rbt12 <= limite:
             efetiva = ((rbt12 * aliquota_nominal) - parcela) / rbt12
-            return max(efetiva, 0.0)
+            return max(efetiva, 0.0), i + 1, reparticao[i]
             
     limite, aliquota_nominal, parcela = anexo[-1]
     efetiva = ((4800000 * aliquota_nominal) - parcela) / 4800000
-    return max(efetiva, 0.0)
+    return max(efetiva, 0.0), 6, reparticao[-1]
 
 def simular_12_meses(dados: List[DadosMes], config: ConfigTributaria, rbt12_inicial: float = 0, folha12m_inicial: float = 0) -> List[ResultadoMes]:
     resultados = []
@@ -116,22 +144,34 @@ def simular_12_meses(dados: List[DadosMes], config: ConfigTributaria, rbt12_inic
             fator_r = folha12m_atual / rbt12_atual
         
         tabela_usada = TABELA_ANEXO_III
+        reparticao_usada = REPARTICAO_ANEXO_III
         if config.fator_r_sujeito and fator_r < 0.28:
             tabela_usada = TABELA_ANEXO_V
+            reparticao_usada = REPARTICAO_ANEXO_V
             
-        aliq_efetiva = get_aliquota_efetiva_simples(rbt12_atual, tabela_usada)
+        aliq_efetiva, faixa, rep = get_aliquota_efetiva_simples(rbt12_atual, tabela_usada, reparticao_usada)
         das_mensal = d.faturamento * aliq_efetiva
         
         res.sn_rbt12 = rbt12_atual
         res.sn_fator_r = fator_r
+        res.sn_faixa = faixa
         res.sn_aliquota_efetiva = aliq_efetiva
-        res.sn_consumo = das_mensal * 0.5
-        res.sn_federal = das_mensal * 0.5
+        
+        res.sn_valor_irpj = das_mensal * rep[0]
+        res.sn_valor_csll = das_mensal * rep[1]
+        res.sn_valor_cofins = das_mensal * rep[2]
+        res.sn_valor_pis = das_mensal * rep[3]
+        res.sn_valor_cpp = das_mensal * rep[4]
+        res.sn_valor_iss = das_mensal * rep[5]
+        
+        # Compatibilidade com o grafico: Consumo = COFINS+PIS+ISS, Federal = IRPJ+CSLL, Encargos = CPP
+        res.sn_federal = res.sn_valor_irpj + res.sn_valor_csll
+        res.sn_consumo = res.sn_valor_cofins + res.sn_valor_pis + res.sn_valor_iss
+        res.sn_encargos = res.sn_valor_cpp
         
         if config.is_anexo_iv:
-            res.sn_encargos = calcula_inss_patronal(d.folha, config)
-        else:
-            res.sn_encargos = 0.0
+            inss_por_fora = calcula_inss_patronal(d.folha, config)
+            res.sn_encargos += inss_por_fora # Soma com a CPP caso exista
             
         # ---------------------------------------------------------
         # LUCRO PRESUMIDO
