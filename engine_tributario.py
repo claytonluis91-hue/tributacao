@@ -18,6 +18,7 @@ class ConfigTributaria:
     fator_r_sujeito: bool
     presuncao_irpj: float
     presuncao_csll: float
+    aliquota_issqn: float
 
 @dataclass
 class ResultadoMes:
@@ -43,6 +44,7 @@ class ResultadoMes:
     lp_base_irpj: float = 0.0
     lp_irpj_csll_normal: float = 0.0
     lp_adicional_irpj: float = 0.0
+    lp_valor_iss: float = 0.0
     lp_federal: float = 0.0
     lp_consumo: float = 0.0
     lp_encargos: float = 0.0
@@ -51,6 +53,7 @@ class ResultadoMes:
     lr_lair: float = 0.0
     lr_irpj_csll_normal: float = 0.0
     lr_adicional_irpj: float = 0.0
+    lr_valor_iss: float = 0.0
     lr_federal: float = 0.0
     lr_consumo: float = 0.0
     lr_encargos: float = 0.0
@@ -61,7 +64,7 @@ class ResultadoMes:
 
     @property
     def total_sn(self):
-        return self.sn_total_das + self.sn_encargos
+        return self.sn_federal + self.sn_consumo + self.sn_encargos
 
     @property
     def total_lp(self):
@@ -177,7 +180,9 @@ def simular_12_meses(dados: List[DadosMes], config: ConfigTributaria, rbt12_inic
         # LUCRO PRESUMIDO
         # ---------------------------------------------------------
         pis_cofins_lp = d.faturamento * 0.0365
-        res.lp_consumo = pis_cofins_lp
+        iss_lp = d.faturamento * config.aliquota_issqn
+        res.lp_valor_iss = iss_lp
+        res.lp_consumo = pis_cofins_lp + iss_lp
         
         base_irpj = d.faturamento * config.presuncao_irpj
         base_csll = d.faturamento * config.presuncao_csll
@@ -204,7 +209,9 @@ def simular_12_meses(dados: List[DadosMes], config: ConfigTributaria, rbt12_inic
         # ---------------------------------------------------------
         pis_cofins_lr_debito = d.faturamento * 0.0925
         pis_cofins_lr_credito = d.compras_credito * 0.0925
-        res.lr_consumo = max(pis_cofins_lr_debito - pis_cofins_lr_credito, 0.0)
+        iss_lr = d.faturamento * config.aliquota_issqn
+        res.lr_valor_iss = iss_lr
+        res.lr_consumo = max(pis_cofins_lr_debito - pis_cofins_lr_credito, 0.0) + iss_lr
         
         inss_lr = calcula_inss_patronal(d.folha, config)
         res.lr_encargos = inss_lr
