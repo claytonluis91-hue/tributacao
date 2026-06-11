@@ -162,17 +162,33 @@ def gerar_excel(resultados, dados_input):
             for cell in worksheet[1]:
                 cell.font = Font(bold=True)
                 cell.fill = header_fill
-            # Ajustar largura
+            
+            # Ajustar largura e formatar dados numéricos
             for col in worksheet.columns:
                 max_length = 0
                 column = col[0].column_letter
-                for cell in col:
+                header_name = str(col[0].value).lower()
+                
+                for i, cell in enumerate(col):
                     try:
-                        if len(str(cell.value)) > max_length:
-                            max_length = len(str(cell.value))
+                        # Ignorar formatação de célula na primeira linha (cabeçalho)
+                        if i > 0 and isinstance(cell.value, (int, float)):
+                            if "alíquota" in header_name or "fator r" in header_name:
+                                cell.number_format = '0.00%'
+                            elif "mês" not in header_name:
+                                # Formato Contábil
+                                cell.number_format = '_-\R$* #,##0.00_-;-\R$* #,##0.00_-;_-\R$* "-"??_-;_-@_-'
+                                
+                        # Atualiza tamanho da coluna
+                        if cell.value:
+                            val_len = len(str(cell.value))
+                            if val_len > max_length:
+                                max_length = val_len
                     except:
                         pass
-                adjusted_width = (max_length + 2)
+                
+                # Ajusta a largura garantindo no mínimo 14 para ficar bonito
+                adjusted_width = max(max_length + 2, 14)
                 worksheet.column_dimensions[column].width = adjusted_width
 
     return output.getvalue()
