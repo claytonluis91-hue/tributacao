@@ -2,6 +2,8 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import io
+import PyPDF2
+import re
 from engine_tributario import (
     DadosMes, 
     ConfigTributaria, 
@@ -16,6 +18,36 @@ st.set_page_config(page_title="Simulador Tributário 12 Meses", layout="wide")
 
 st.title("📊 Simulador e Comparador Tributário (12 Meses)")
 st.markdown("Comparativo de carga tributária entre **Simples Nacional**, **Lucro Presumido** e **Lucro Real**.")
+
+# ---------------------------------------------------------
+# EXTRAÇÃO DE DADOS
+# ---------------------------------------------------------
+def extrair_dados_pgdas(file_bytes):
+    try:
+        reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
+        text = ""
+        for page in reader.pages:
+            text += page.extract_text() + "\n"
+        
+        rbt12 = 0.0
+        folha = 0.0
+        
+        # Buscar RBT12 - "Receita bruta acumulada nos doze meses anteriores ao PA (RBT12)"
+        match_rbt12 = re.search(r'\(RBT12\)\s+([\d\.]+,\d{2})', text)
+        if match_rbt12:
+            valor_str = match_rbt12.group(1).replace(".", "").replace(",", ".")
+            rbt12 = float(valor_str)
+            
+        # Buscar Folha - "Total de Folhas de Salários Anteriores (R$)"
+        match_folha = re.search(r'Total de Folhas de Salários Anteriores \(R\$\)\s+R\$\s+([\d\.]+,\d{2})', text)
+        if match_folha:
+            valor_str = match_folha.group(1).replace(".", "").replace(",", ".")
+            folha = float(valor_str)
+            
+        return rbt12, folha
+    except Exception as e:
+        st.error(f"Erro ao extrair dados do PGDAS: {e}")
+        return 0.0, 0.0
 
 # ---------------------------------------------------------
 # SIDEBAR - CONFIGURAÇÕES FIXAS
@@ -52,12 +84,32 @@ config = ConfigTributaria(
 # ---------------------------------------------------------
 # INPUTS GLOBAIS NA TELA PRINCIPAL
 # ---------------------------------------------------------
+st.markdown("### 📥 Importação de PGDAS")
+arquivo_pgdas = st.file_uploader("Envie o Extrato do PGDAS (PDF) para preencher automaticamente", type=["pdf"])
+
+if "pgdas_rbt12" not in st.session_state:
+    st.session_state["pgdas_rbt12"] = 0.0
+if "pgdas_folha" not in st.session_state:
+    st.session_state["pgdas_folha"] = 0.0
+
+if arquivo_pgdas is not None:
+    # Apenas tenta ler se for diferente do que já está em memória para evitar recálculos contínuos
+    if "last_uploaded_file" not in st.session_state or st.session_state["last_uploaded_file"] != arquivo_pgdas.name:
+        rbt, folha = extrair_dados_pgdas(arquivo_pgdas.read())
+        if rbt > 0:
+            st.session_state["pgdas_rbt12"] = rbt
+            st.session_state["pgdas_folha"] = folha
+            st.session_state["last_uploaded_file"] = arquivo_pgdas.name
+            st.success(f"Dados extraídos com sucesso! RBT12: R$ {rbt:,.2f} | Folha: R$ {folha:,.2f}")
+
+st.divider()
+
 st.markdown("### Histórico Acumulado (Últimos 12 Meses)")
 col_rbt, col_folha = st.columns(2)
 with col_rbt:
-    rbt12_inicial = st.number_input("RBT12 Acumulado (Anterior) - Deixe 0 se nova", value=0.0, step=10000.0)
+    rbt12_inicial = st.number_input("RBT12 Acumulado (Anterior) - Deixe 0 se nova", value=st.session_state["pgdas_rbt12"], step=10000.0)
 with col_folha:
-    folha12m_inicial = st.number_input("Folha 12M (Anterior) - Deixe 0 se nova", value=0.0, step=10000.0)
+    folha12m_inicial = st.number_input("Folha 12M (Anterior) - Deixe 0 se nova", value=st.session_state["pgdas_folha"], step=10000.0)
 
 st.divider()
 tab_projecao, tab_mensal = st.tabs(["📅 Projeção 12 Meses", "⏱️ Simulação Mensal Rápida"])
@@ -332,11 +384,25 @@ def exibir_resultados(resultados):
 # ==========================================
 with tab_projecao:
     st.subheader("📝 Preencha a Projeção (12 Meses)")
+    
+    col_proj1, col_proj2 = st.columns([2, 1])
+    with col_proj1:
+        st.markdown("Se você importou o PGDAS ou preencheu o histórico, pode usar os valores médios para projetar os próximos 12 meses automaticamente.")
+    with col_proj2:
+        taxa_crescimento = st.number_input("Taxa de Crescimento Esperada (%)", value=0.0, step=1.0)
+        
+    if st.button("Aplicar Projeção Automática", use_container_width=True):
+        media_fat = (rbt12_inicial / 12) * (1 + taxa_crescimento/100) if rbt12_inicial > 0 else 0.0
+        media_folha = (folha12m_inicial / 12) * (1 + taxa_crescimento/100) if folha12m_inicial > 0 else 0.0
+        st.session_state["proj_fat"] = [media_fat] * 12
+        st.session_state["proj_folha"] = [media_folha] * 12
+        st.rerun()
+        
     meses = [f"Mês {i}" for i in range(1, 13)]
     df_initial = pd.DataFrame({
         "Mês": meses,
-        "Faturamento Bruto": [0.0] * 12,
-        "Folha de Pagamento": [0.0] * 12,
+        "Faturamento Bruto": st.session_state.get("proj_fat", [0.0] * 12),
+        "Folha de Pagamento": st.session_state.get("proj_folha", [0.0] * 12),
         "Despesas Dedutíveis (LR)": [0.0] * 12,
         "Compras c/ Crédito PIS/COFINS": [0.0] * 12
     })
