@@ -32,14 +32,14 @@ def extrair_dados_pgdas(file_bytes):
         rbt12 = 0.0
         folha = 0.0
         
-        # Buscar RBT12 - "Receita bruta acumulada nos doze meses anteriores ao PA (RBT12)"
-        match_rbt12 = re.search(r'\(RBT12\)\s+([\d\.]+,\d{2})', text)
+        # Buscar RBT12 - tolerando falta de espaço
+        match_rbt12 = re.search(r'\(RBT12\)\s*([\d\.]+,\d{2})', text)
         if match_rbt12:
             valor_str = match_rbt12.group(1).replace(".", "").replace(",", ".")
             rbt12 = float(valor_str)
             
-        # Buscar Folha - "Total de Folhas de Salários Anteriores (R$)"
-        match_folha = re.search(r'Total de Folhas de Salários Anteriores \(R\$\)\s+R\$\s+([\d\.]+,\d{2})', text)
+        # Buscar Folha - tolerando erro de enconding na palavra "Salários" (ex: "Salrios")
+        match_folha = re.search(r'Total de Folhas de Sal.*?rios Anteriores \(R\$\)\s*R\$\s*([\d\.]+,\d{2})', text)
         if match_folha:
             valor_str = match_folha.group(1).replace(".", "").replace(",", ".")
             folha = float(valor_str)
@@ -389,7 +389,20 @@ with tab_projecao:
     with col_proj1:
         st.markdown("Se você importou o PGDAS ou preencheu o histórico, pode usar os valores médios para projetar os próximos 12 meses automaticamente.")
     with col_proj2:
-        taxa_crescimento = st.number_input("Taxa de Crescimento Esperada (%)", value=0.0, step=1.0)
+        opcao_projecao = st.selectbox(
+            "Cálculo de Projeção", 
+            ["Média (0% Crescimento)", "Taxa Padrão (5%)", "Taxa Padrão (10%)", "Taxa Padrão (15%)", "Taxa Personalizada"]
+        )
+        if opcao_projecao == "Média (0% Crescimento)":
+            taxa_crescimento = 0.0
+        elif opcao_projecao == "Taxa Padrão (5%)":
+            taxa_crescimento = 5.0
+        elif opcao_projecao == "Taxa Padrão (10%)":
+            taxa_crescimento = 10.0
+        elif opcao_projecao == "Taxa Padrão (15%)":
+            taxa_crescimento = 15.0
+        else:
+            taxa_crescimento = st.number_input("Taxa Personalizada (%)", value=0.0, step=1.0)
         
     if st.button("Aplicar Projeção Automática", use_container_width=True):
         media_fat = (rbt12_inicial / 12) * (1 + taxa_crescimento/100) if rbt12_inicial > 0 else 0.0
