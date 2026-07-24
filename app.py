@@ -1,73 +1,212 @@
-import streamlit as st
+from datetime import datetime
+
 import pandas as pd
 import plotly.express as px
-import io
-import PyPDF2
-import re
-from engine_tributario import (
-    DadosMes, 
-    ConfigTributaria, 
-    simular_12_meses
-)
-from db import init_db, salvar_simulacao, listar_simulacoes
+import plotly.graph_objects as go
+import streamlit as st
 
-# Inicializar DB
+from db import init_db, listar_simulacoes, salvar_simulacao
+from engine_tributario import ConfigTributaria, DadosMes, simular_12_meses
+from excel_export import gerar_excel
+from pgdas_parser import extrair_dados_pgdas
+
+
+st.set_page_config(
+    page_title="TributaSim | Planejamento tributário",
+    page_icon="📊",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+st.markdown(
+    """
+    <style>
+      .stApp { background: #f8fafc; }
+      [data-testid="stSidebar"] { background: #0f172a; }
+      [data-testid="stSidebar"] * { color: #f8fafc; }
+      [data-testid="stSidebar"] input {
+        color: #0f172a !important;
+        -webkit-text-fill-color: #0f172a !important;
+        caret-color: #0f172a;
+      }
+      [data-testid="stSidebar"] [data-baseweb="input"] button,
+      [data-testid="stSidebar"] [data-baseweb="input"] button * {
+        color: #475569 !important;
+        fill: #475569 !important;
+      }
+      [data-testid="stSidebar"] [data-testid="stExpander"] summary,
+      [data-testid="stSidebar"] [data-testid="stExpander"] summary * {
+        color: #0f172a !important;
+        fill: #0f172a !important;
+      }
+      .hero {
+        padding: 1.6rem 1.8rem; border-radius: 18px;
+        background: linear-gradient(125deg, #0f172a 0%, #0f766e 100%);
+        color: white; margin-bottom: 1rem; box-shadow: 0 12px 32px #0f172a20;
+      }
+      .hero h1 { margin: 0; font-size: 2rem; }
+      .hero p { margin: .45rem 0 0; color: #ccfbf1; }
+      .section-note {
+        border-left: 4px solid #0f766e; background: white; padding: .8rem 1rem;
+        border-radius: 8px; color: #334155; margin: .5rem 0 1rem;
+      }
+      div[data-testid="stMetric"] {
+        background: white; border: 1px solid #e2e8f0; padding: 1rem;
+        border-radius: 14px; box-shadow: 0 4px 16px #0f172a0d;
+      }
+      .stTabs [data-baseweb="tab-list"] { gap: .5rem; }
+      .stTabs [data-baseweb="tab"] {
+        background: white; border-radius: 10px 10px 0 0; padding: .6rem 1rem;
+      }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 init_db()
 
-st.set_page_config(page_title="Simulador Tributário 12 Meses", layout="wide")
 
-st.title("📊 Simulador e Comparador Tributário (12 Meses)")
-st.markdown("Comparativo de carga tributária entre **Simples Nacional**, **Lucro Presumido** e **Lucro Real**.")
+def reais(valor: float) -> str:
+    return f"R$ {valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
-# ---------------------------------------------------------
-# EXTRAÇÃO DE DADOS
-# ---------------------------------------------------------
-def extrair_dados_pgdas(file_bytes):
-    try:
-        reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
-        text = ""
-        for page in reader.pages:
-            text += page.extract_text() + "\n"
-        
-        rbt12 = 0.0
-        folha = 0.0
-        
-        # Buscar RBT12 - tolerando falta de espaço
-        match_rbt12 = re.search(r'\(RBT12\)\s*([\d\.]+,\d{2})', text)
-        if match_rbt12:
-            valor_str = match_rbt12.group(1).replace(".", "").replace(",", ".")
-            rbt12 = float(valor_str)
-            
-        # Buscar Folha - tolerando erro de enconding na palavra "Salários" (ex: "Salrios")
-        match_folha = re.search(r'Total de Folhas de Sal.*?rios Anteriores \(R\$\)\s*R\$\s*([\d\.]+,\d{2})', text)
-        if match_folha:
-            valor_str = match_folha.group(1).replace(".", "").replace(",", ".")
-            folha = float(valor_str)
-            
-        return rbt12, folha
-    except Exception as e:
-        st.error(f"Erro ao extrair dados do PGDAS: {e}")
-        return 0.0, 0.0
 
-# ---------------------------------------------------------
-# SIDEBAR - CONFIGURAÇÕES FIXAS
-# ---------------------------------------------------------
+def periodo(valor: str) -> pd.Period:
+    return pd.to_datetime(f"01/{valor}", dayfirst=True).to_period("M")
+
+
+def historico_vazio() -> list[dict]:
+    fim = pd.Period(datetime.now(), freq="M") - 1
+    meses = pd.period_range(end=fim, periods=12, freq="M")
+    return [
+        {
+            "Competência": item.strftime("%m/%Y"),
+            "Faturamento": 0.0,
+            "Folha": 0.0,
+            "Origem": "Entrada manual",
+        }
+        for item in meses
+    ]
+
+
+def gerar_projecao(
+    historico: pd.DataFrame,
+    metodo: str,
+    crescimento: float,
+    despesas_pct: float,
+    creditos_pct: float,
+) -> pd.DataFrame:
+    hist = historico.copy().tail(12)
+    receitas = hist["Faturamento"].astype(float).tolist()
+    folhas = hist["Folha"].astype(float).tolist()
+    ultima_competencia = periodo(str(hist.iloc[-1]["Competência"]))
+    futuras = [ultima_competencia + i for i in range(1, 13)]
+
+    if metodo.startswith("Sazonalidade"):
+        proj_receita = receitas
+        proj_folha = folhas
+    elif metodo.startswith("Média dos últimos 3"):
+        proj_receita = [sum(receitas[-3:]) / 3] * 12
+        proj_folha = [sum(folhas[-3:]) / 3] * 12
+    else:
+        proj_receita = [sum(receitas) / 12] * 12
+        proj_folha = [sum(folhas) / 12] * 12
+
+    # A taxa anual é aplicada ao mês equivalente do histórico; a tabela fica
+    # totalmente editável antes do cálculo.
+    fator = 1 + crescimento
+    proj_receita = [max(valor * fator, 0) for valor in proj_receita]
+    proj_folha = [max(valor * fator, 0) for valor in proj_folha]
+    return pd.DataFrame(
+        {
+            "Competência": [item.strftime("%m/%Y") for item in futuras],
+            "Faturamento": proj_receita,
+            "Folha": proj_folha,
+            "Despesas dedutíveis (LR)": [valor * despesas_pct for valor in proj_receita],
+            "Base de aquisições com crédito": [valor * creditos_pct for valor in proj_receita],
+        }
+    )
+
+
+def dataframe_resultados(resultados) -> pd.DataFrame:
+    linhas = []
+    for r in resultados:
+        custos = {
+            "Simples Nacional": r.total_sn,
+            "Lucro Presumido": r.total_lp,
+            "Lucro Real": r.total_lr,
+        }
+        ordem = sorted(custos.items(), key=lambda item: item[1])
+        linhas.append(
+            {
+                "Competência": r.competencia,
+                "Faturamento": r.faturamento,
+                "RBT12": r.sn_rbt12,
+                "Fator R": r.sn_fator_r,
+                "Anexo": r.sn_anexo,
+                "Alíquota SN": r.sn_aliquota_efetiva,
+                "Simples Nacional": r.total_sn,
+                "Lucro Presumido": r.total_lp,
+                "Lucro Real": r.total_lr,
+                "Melhor regime": ordem[0][0],
+                "Economia para o 2º": ordem[1][1] - ordem[0][1],
+            }
+        )
+    return pd.DataFrame(linhas)
+
+
+if "historico" not in st.session_state:
+    st.session_state.historico = historico_vazio()
+if "projecao" not in st.session_state:
+    st.session_state.projecao = None
+if "metadados_pgdas" not in st.session_state:
+    st.session_state.metadados_pgdas = {}
+
+
 with st.sidebar:
-    st.header("⚙️ Configurações Globais")
-    
-    st.subheader("Encargos e Folha")
-    aliquota_rat = st.number_input("Alíquota RAT (%)", value=2.0, step=0.5) / 100
-    fap = st.number_input("FAP", value=1.0, step=0.1)
-    aliquota_terceiros = st.number_input("Terceiros (%)", value=5.8, step=0.1) / 100
-    
-    st.subheader("Simples Nacional")
-    is_anexo_iv = st.checkbox("Anexo IV (INSS Patronal por Fora)?", value=False)
-    fator_r_sujeito = st.checkbox("Sujeito ao Fator R (Anexo III vs V)?", value=True)
-    
-    st.subheader("Lucro Presumido e Real")
-    presuncao_irpj = st.number_input("Presunção IRPJ (%)", value=32.0, step=1.0) / 100
-    presuncao_csll = st.number_input("Presunção CSLL (%)", value=32.0, step=1.0) / 100
-    aliquota_issqn = st.number_input("Alíquota ISSQN (%)", value=0.0, step=0.5) / 100
+    st.markdown("## Premissas tributárias")
+    st.caption("Parâmetros editáveis usados em todos os cenários.")
+    ano_referencia = st.number_input("Ano de referência", 2026, 2032, 2026, 1)
+    aliquota_issqn = (
+        st.number_input(
+            "ISS (%)",
+            min_value=0.0,
+            max_value=5.0,
+            value=2.0,
+            step=0.25,
+            help="Confirme a alíquota da atividade no município competente.",
+        )
+        / 100
+    )
+
+    with st.expander("Simples Nacional", expanded=True):
+        is_anexo_iv = st.checkbox(
+            "Atividade no Anexo IV",
+            value=False,
+            help="No Anexo IV a CPP patronal não integra o DAS.",
+        )
+        fator_r_sujeito = st.checkbox(
+            "Atividade sujeita ao Fator R",
+            value=True,
+            disabled=is_anexo_iv,
+            help="Anexo III quando o Fator R é igual ou superior a 28%; Anexo V abaixo de 28%.",
+        )
+
+    with st.expander("Folha e encargos"):
+        aliquota_rat = st.number_input("RAT (%)", 0.0, 3.0, 2.0, 0.5) / 100
+        fap = st.number_input("FAP", 0.5, 2.0, 1.0, 0.1)
+        aliquota_terceiros = st.number_input("Terceiros (%)", 0.0, 10.0, 5.8, 0.1) / 100
+        st.caption(
+            f"Encargo patronal simulado: {(0.20 + aliquota_rat * fap + aliquota_terceiros):.2%}"
+        )
+
+    with st.expander("Lucro Presumido"):
+        presuncao_irpj = st.number_input("Presunção IRPJ (%)", 0.0, 100.0, 32.0, 1.0) / 100
+        presuncao_csll = st.number_input("Presunção CSLL (%)", 0.0, 100.0, 32.0, 1.0) / 100
+
+    st.warning(
+        "2026 é ano-teste de IBS/CBS. O modelo mantém PIS/Cofins/ISS na carga e considera "
+        "a dispensa do recolhimento-teste condicionada às obrigações acessórias."
+    )
 
 config = ConfigTributaria(
     aliquota_rat=aliquota_rat,
@@ -77,437 +216,344 @@ config = ConfigTributaria(
     fator_r_sujeito=fator_r_sujeito,
     presuncao_irpj=presuncao_irpj,
     presuncao_csll=presuncao_csll,
-    aliquota_issqn=aliquota_issqn
+    aliquota_issqn=aliquota_issqn,
+    ano_referencia=int(ano_referencia),
 )
 
+st.markdown(
+    """
+    <div class="hero">
+      <h1>TributaSim</h1>
+      <p>Planejamento tributário com histórico real, projeção mensal e memória de cálculo.</p>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
-# ---------------------------------------------------------
-# INPUTS GLOBAIS NA TELA PRINCIPAL
-# ---------------------------------------------------------
-st.markdown("### 📥 Importação de PGDAS")
-arquivo_pgdas = st.file_uploader("Envie o Extrato do PGDAS (PDF) para preencher automaticamente", type=["pdf"])
+tab_historico, tab_projecao, tab_resultado = st.tabs(
+    ["1 · Histórico", "2 · Projeção", "3 · Resultado e Excel"]
+)
 
-if "pgdas_rbt12" not in st.session_state:
-    st.session_state["pgdas_rbt12"] = 0.0
-if "pgdas_folha" not in st.session_state:
-    st.session_state["pgdas_folha"] = 0.0
+with tab_historico:
+    st.subheader("Importe o PGDAS-D ou informe os últimos 12 meses")
+    st.markdown(
+        '<div class="section-note">O histórico mensal é essencial: cada projeção retira o mês '
+        "mais antigo e acrescenta o novo faturamento para recalcular RBT12, FS12 e Fator R.</div>",
+        unsafe_allow_html=True,
+    )
+    arquivo = st.file_uploader("Extrato do PGDAS-D (PDF)", type=["pdf"])
+    if arquivo is not None:
+        chave = f"{arquivo.name}:{arquivo.size}"
+        if st.session_state.get("arquivo_processado") != chave:
+            try:
+                extraido = extrair_dados_pgdas(arquivo.getvalue())
+                if len(extraido["historico"]) == 12:
+                    st.session_state.historico = extraido["historico"]
+                    st.session_state.metadados_pgdas = {
+                        "arquivo_pgdas": arquivo.name,
+                        "pa": extraido["pa"],
+                        "rbt12_declarado": extraido["rbt12"],
+                        "fator_r_declarado": extraido["fator_r"],
+                    }
+                    st.session_state.arquivo_processado = chave
+                    st.session_state.projecao = None
+                    st.success(
+                        f"PGDAS importado: PA {extraido['pa']} • RPA {reais(extraido['rpa'])} • "
+                        f"RBT12 declarado {reais(extraido['rbt12'])}."
+                    )
+                else:
+                    st.error("O PDF não forneceu 12 competências utilizáveis. Complete a tabela manualmente.")
+            except Exception as exc:
+                st.error(f"Não foi possível ler o PGDAS-D: {exc}")
 
-if arquivo_pgdas is not None:
-    # Apenas tenta ler se for diferente do que já está em memória para evitar recálculos contínuos
-    if "last_uploaded_file" not in st.session_state or st.session_state["last_uploaded_file"] != arquivo_pgdas.name:
-        rbt, folha = extrair_dados_pgdas(arquivo_pgdas.read())
-        if rbt > 0:
-            st.session_state["pgdas_rbt12"] = rbt
-            st.session_state["pgdas_folha"] = folha
-            st.session_state["last_uploaded_file"] = arquivo_pgdas.name
-            st.success(f"Dados extraídos com sucesso! RBT12: R$ {rbt:,.2f} | Folha: R$ {folha:,.2f}")
-
-st.divider()
-
-st.markdown("### Histórico Acumulado (Últimos 12 Meses)")
-col_rbt, col_folha = st.columns(2)
-with col_rbt:
-    rbt12_inicial = st.number_input("RBT12 Acumulado (Anterior) - Deixe 0 se nova", value=st.session_state["pgdas_rbt12"], step=10000.0)
-with col_folha:
-    folha12m_inicial = st.number_input("Folha 12M (Anterior) - Deixe 0 se nova", value=st.session_state["pgdas_folha"], step=10000.0)
-
-st.divider()
-tab_projecao, tab_mensal = st.tabs(["📅 Projeção 12 Meses", "⏱️ Simulação Mensal Rápida"])
-
-# ==========================================
-# FUNÇÕES E IMPORTS AUXILIARES
-# ==========================================
-from openpyxl.styles import Font, PatternFill
-def gerar_excel(resultados, dados_input):
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        
-        # Tabela 0: Resumo Comparativo
-        resumo_data = []
-        for r in resultados:
-            vencedor_mes = min({"Simples": r.total_sn, "Presumido": r.total_lp, "Real": r.total_lr}.items(), key=lambda x: x[1])
-            resumo_data.append({
-                "Mês": r.mes,
-                "Faturamento": r.faturamento,
-                "Total Simples Nacional": r.total_sn,
-                "Total Lucro Presumido": r.total_lp,
-                "Total Lucro Real": r.total_lr,
-                "Melhor Regime": vencedor_mes[0],
-                "Economia (Diferença para o 2º)": sorted([r.total_sn, r.total_lp, r.total_lr])[1] - vencedor_mes[1]
-            })
-        df_resumo = pd.DataFrame(resumo_data)
-        df_resumo.to_excel(writer, sheet_name="Resumo Comparativo", index=False)
-
-        # Tabela 1: Simples Nacional
-        sn_data = []
-        for r in resultados:
-            sn_data.append({
-                "Mês": r.mes,
-                "Faturamento": r.faturamento,
-                "RBT12 Calculado": r.sn_rbt12,
-                "Faixa Anexo": f"Faixa {r.sn_faixa}",
-                "Alíquota Efetiva": r.sn_aliquota_efetiva,
-                "Valor Total DAS": r.sn_total_das,
-                "IRPJ": r.sn_valor_irpj,
-                "CSLL": r.sn_valor_csll,
-                "COFINS": r.sn_valor_cofins,
-                "PIS/Pasep": r.sn_valor_pis,
-                "CPP (INSS)": r.sn_valor_cpp,
-                "ISS": r.sn_valor_iss,
-                "INSS Extra (Folha)": r.sn_encargos - r.sn_valor_cpp,
-                "Total Mês": r.total_sn
-            })
-        pd.DataFrame(sn_data).to_excel(writer, sheet_name="Simples Nacional", index=False)
-
-        # Tabela 2: Lucro Presumido
-        lp_data = []
-        for r in resultados:
-            lp_data.append({
-                "Mês": r.mes,
-                "Faturamento": r.faturamento,
-                "Base IRPJ": r.lp_base_irpj,
-                "Alíq. IRPJ/CSLL": "15% / 9%",
-                "IRPJ/CSLL Normal": r.lp_irpj_csll_normal,
-                "Adicional IRPJ (10%)": r.lp_adicional_irpj,
-                "Alíq. PIS/COFINS": "3.65%",
-                "PIS/COFINS": r.lp_consumo - r.lp_valor_iss,
-                "ISS": r.lp_valor_iss,
-                "INSS Patronal": r.lp_encargos,
-                "Total Mês": r.total_lp
-            })
-        pd.DataFrame(lp_data).to_excel(writer, sheet_name="Lucro Presumido", index=False)
-
-        # Tabela 3: Lucro Real
-        lr_data = []
-        for r in resultados:
-            lr_data.append({
-                "Mês": r.mes,
-                "Faturamento": r.faturamento,
-                "LAIR": r.lr_lair,
-                "Alíq. IRPJ/CSLL": "15% / 9%",
-                "IRPJ/CSLL Normal": r.lr_irpj_csll_normal,
-                "Adicional IRPJ (>20k)": r.lr_adicional_irpj,
-                "Alíq. PIS/COFINS": "9.25% (Não Cumulativo)",
-                "PIS/COFINS Liq": r.lr_consumo - r.lr_valor_iss,
-                "ISS": r.lr_valor_iss,
-                "INSS Patronal": r.lr_encargos,
-                "Total Mês": r.total_lr
-            })
-        pd.DataFrame(lr_data).to_excel(writer, sheet_name="Lucro Real", index=False)
-        
-        # Formatando as planilhas
-        for sheet_name in writer.sheets:
-            worksheet = writer.sheets[sheet_name]
-            header_fill = PatternFill(start_color="D3D3D3", end_color="D3D3D3", fill_type="solid")
-            for cell in worksheet[1]:
-                cell.font = Font(bold=True)
-                cell.fill = header_fill
-            
-            for col in worksheet.columns:
-                max_length = 0
-                column = col[0].column_letter
-                header_name = str(col[0].value).lower()
-                for i, cell in enumerate(col):
-                    try:
-                        if i > 0 and isinstance(cell.value, (int, float)):
-                            if "alíquota" in header_name or "fator r" in header_name:
-                                cell.number_format = '0.00%'
-                            elif "mês" not in header_name:
-                                cell.number_format = r'_-\R$* #,##0.00_-;-\R$* #,##0.00_-;_-\R$* "-"??_-;_-@_-'
-                        if cell.value:
-                            val_len = len(str(cell.value))
-                            if val_len > max_length:
-                                max_length = val_len
-                    except:
-                        pass
-                adjusted_width = max(max_length + 2, 14)
-                worksheet.column_dimensions[column].width = adjusted_width
-    return output.getvalue()
-
-def formata_reais(valor):
-    return f"R$ {valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-
-def renderizar_impacto_folha(resultados, config_global):
-    st.markdown("### 📈 Impacto da Folha de Pagamento")
-    st.markdown("Esta seção isola os custos associados aos empregados e o benefício/risco do **Fator R** (para Anexo III vs V do Simples).")
-    
-    tot_sn_cpp = sum(r.sn_valor_cpp for r in resultados)
-    tot_sn_extra = sum(r.sn_encargos - r.sn_valor_cpp for r in resultados)
-    tot_lp_enc = sum(r.lp_encargos for r in resultados)
-    tot_lr_enc = sum(r.lr_encargos for r in resultados)
-    
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.info(f"**Simples Nacional**\nCPP na DAS: {formata_reais(tot_sn_cpp)}\nINSS Extra: {formata_reais(tot_sn_extra)}\n**Total: {formata_reais(tot_sn_cpp + tot_sn_extra)}**")
-    with col2:
-        st.warning(f"**Lucro Presumido**\nINSS Patronal (RAT/Terceiros):\n**Total: {formata_reais(tot_lp_enc)}**")
-    with col3:
-        st.error(f"**Lucro Real**\nINSS Patronal (RAT/Terceiros):\n**Total: {formata_reais(tot_lr_enc)}**")
-        
-    df_fator_r = pd.DataFrame([{"Mês": r.mes, "Fator R Calculado": f"{r.sn_fator_r*100:.2f}%", "Faixa/Anexo": f"Faixa {r.sn_faixa}"} for r in resultados])
-    with st.expander("Verificar Fator R Mês a Mês (Simples Nacional)"):
-        st.dataframe(df_fator_r, use_container_width=True, hide_index=True)
-
-def renderizar_detalhes_tributos(resultados):
-    st.markdown("### 🔍 Detalhamento de Tributos")
-    tab_efetiva, tab_nominal = st.tabs(["📊 Alíquotas Efetivas (s/ Faturamento Bruto)", "📜 Alíquotas Nominais"])
-    
-    tot_fat = sum(r.faturamento for r in resultados)
-    if tot_fat == 0:
-        tot_fat = 1  # prevent div/0
-        
-    sn_irpj = sum(r.sn_valor_irpj for r in resultados)
-    sn_csll = sum(r.sn_valor_csll for r in resultados)
-    sn_cofins = sum(r.sn_valor_cofins for r in resultados)
-    sn_pis = sum(r.sn_valor_pis for r in resultados)
-    sn_cpp = sum(r.sn_valor_cpp for r in resultados)
-    sn_iss = sum(r.sn_valor_iss for r in resultados)
-    sn_extra = sum(r.sn_encargos - r.sn_valor_cpp for r in resultados)
-    sn_total = sum(r.total_sn for r in resultados)
-    
-    lp_fed = sum(r.lp_federal for r in resultados)
-    lp_pis_cofins = sum(r.lp_consumo - r.lp_valor_iss for r in resultados)
-    lp_iss = sum(r.lp_valor_iss for r in resultados)
-    lp_enc = sum(r.lp_encargos for r in resultados)
-    lp_total = sum(r.total_lp for r in resultados)
-    
-    lr_fed = sum(r.lr_federal for r in resultados)
-    lr_pis_cofins = sum(r.lr_consumo - r.lr_valor_iss for r in resultados)
-    lr_iss = sum(r.lr_valor_iss for r in resultados)
-    lr_enc = sum(r.lr_encargos for r in resultados)
-    lr_total = sum(r.total_lr for r in resultados)
-
-    def pct(valor):
-        return f"{(valor / tot_fat)*100:.2f}%"
-
-    with tab_efetiva:
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            st.markdown("**Simples Nacional**")
-            st.markdown(f"- IRPJ: {formata_reais(sn_irpj)} ({pct(sn_irpj)})")
-            st.markdown(f"- CSLL: {formata_reais(sn_csll)} ({pct(sn_csll)})")
-            st.markdown(f"- COFINS: {formata_reais(sn_cofins)} ({pct(sn_cofins)})")
-            st.markdown(f"- PIS: {formata_reais(sn_pis)} ({pct(sn_pis)})")
-            st.markdown(f"- ISS: {formata_reais(sn_iss)} ({pct(sn_iss)})")
-            st.markdown(f"- CPP (DAS): {formata_reais(sn_cpp)} ({pct(sn_cpp)})")
-            st.markdown(f"- INSS Extra: {formata_reais(sn_extra)} ({pct(sn_extra)})")
-            st.markdown(f"**Total: {formata_reais(sn_total)} ({pct(sn_total)})**")
-            
-        with c2:
-            st.markdown("**Lucro Presumido**")
-            st.markdown(f"- IRPJ + CSLL: {formata_reais(lp_fed)} ({pct(lp_fed)})")
-            st.markdown(f"- PIS/COFINS: {formata_reais(lp_pis_cofins)} ({pct(lp_pis_cofins)})")
-            st.markdown(f"- ISS: {formata_reais(lp_iss)} ({pct(lp_iss)})")
-            st.markdown(f"- INSS Patronal: {formata_reais(lp_enc)} ({pct(lp_enc)})")
-            st.markdown(f"**Total: {formata_reais(lp_total)} ({pct(lp_total)})**")
-            
-        with c3:
-            st.markdown("**Lucro Real**")
-            st.markdown(f"- IRPJ + CSLL: {formata_reais(lr_fed)} ({pct(lr_fed)})")
-            st.markdown(f"- PIS/COFINS Liq.: {formata_reais(lr_pis_cofins)} ({pct(lr_pis_cofins)})")
-            st.markdown(f"- ISS: {formata_reais(lr_iss)} ({pct(lr_iss)})")
-            st.markdown(f"- INSS Patronal: {formata_reais(lr_enc)} ({pct(lr_enc)})")
-            st.markdown(f"**Total: {formata_reais(lr_total)} ({pct(lr_total)})**")
-
-    with tab_nominal:
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            st.markdown("**Simples Nacional**")
-            st.info("No Simples Nacional as alíquotas variam conforme a faixa. Verifique o Excel para ver o detalhamento mês a mês.")
-            st.markdown(f"**Total Pago: {formata_reais(sn_total)}**")
-            
-        with c2:
-            st.markdown("**Lucro Presumido**")
-            st.markdown(f"- IRPJ (15%) + CSLL (9%): {formata_reais(lp_fed)}")
-            st.markdown(f"- PIS (0.65%) / COFINS (3%): {formata_reais(lp_pis_cofins)}")
-            st.markdown(f"- ISS ({config.aliquota_issqn*100:.2f}%): {formata_reais(lp_iss)}")
-            st.markdown(f"- INSS Patronal: {formata_reais(lp_enc)}")
-            st.markdown(f"**Total: {formata_reais(lp_total)}**")
-            
-        with c3:
-            st.markdown("**Lucro Real**")
-            st.markdown(f"- IRPJ (15%) + CSLL (9%): {formata_reais(lr_fed)}")
-            st.markdown(f"- PIS (1.65%) / COFINS (7.6%): {formata_reais(lr_pis_cofins)}")
-            st.markdown(f"- ISS ({config.aliquota_issqn*100:.2f}%): {formata_reais(lr_iss)}")
-            st.markdown(f"- INSS Patronal: {formata_reais(lr_enc)}")
-            st.markdown(f"**Total: {formata_reais(lr_total)}**")
-
-def exibir_resultados(resultados):
-    total_sn_fed = sum(r.sn_federal for r in resultados)
-    total_sn_con = sum(r.sn_consumo for r in resultados)
-    total_sn_enc = sum(r.sn_encargos for r in resultados)
-    total_sn = sum(r.total_sn for r in resultados)
-    
-    total_lp_fed = sum(r.lp_federal for r in resultados)
-    total_lp_con = sum(r.lp_consumo for r in resultados)
-    total_lp_enc = sum(r.lp_encargos for r in resultados)
-    total_lp = sum(r.total_lp for r in resultados)
-    
-    total_lr_fed = sum(r.lr_federal for r in resultados)
-    total_lr_con = sum(r.lr_consumo for r in resultados)
-    total_lr_enc = sum(r.lr_encargos for r in resultados)
-    total_lr = sum(r.total_lr for r in resultados)
-    
-    totais = {"Simples Nacional": total_sn, "Lucro Presumido": total_lp, "Lucro Real": total_lr}
-    vencedor = min(totais, key=totais.get)
-    
-    st.divider()
-    st.header(f"🏆 Melhor Regime: :green[{vencedor}]")
-    
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Simples Nacional", formata_reais(total_sn), delta="Vencedor!" if vencedor=="Simples Nacional" else None, delta_color="normal" if vencedor=="Simples Nacional" else "off")
-    col2.metric("Lucro Presumido", formata_reais(total_lp), delta="Vencedor!" if vencedor=="Lucro Presumido" else None, delta_color="normal" if vencedor=="Lucro Presumido" else "off")
-    col3.metric("Lucro Real", formata_reais(total_lr), delta="Vencedor!" if vencedor=="Lucro Real" else None, delta_color="normal" if vencedor=="Lucro Real" else "off")
-    
-    st.subheader("Composição dos Custos Tributários")
-    dados_grafico = [
-        {"Regime": "Simples Nacional", "Categoria": "Impostos Federais (IRPJ/CSLL)", "Valor": total_sn_fed},
-        {"Regime": "Simples Nacional", "Categoria": "Impostos s/ Consumo (PIS/COFINS/ISS/DAS)", "Valor": total_sn_con},
-        {"Regime": "Simples Nacional", "Categoria": "Encargos s/ Folha (INSS)", "Valor": total_sn_enc},
-        {"Regime": "Lucro Presumido", "Categoria": "Impostos Federais (IRPJ/CSLL)", "Valor": total_lp_fed},
-        {"Regime": "Lucro Presumido", "Categoria": "Impostos s/ Consumo (PIS/COFINS/ISS/DAS)", "Valor": total_lp_con},
-        {"Regime": "Lucro Presumido", "Categoria": "Encargos s/ Folha (INSS)", "Valor": total_lp_enc},
-        {"Regime": "Lucro Real", "Categoria": "Impostos Federais (IRPJ/CSLL)", "Valor": total_lr_fed},
-        {"Regime": "Lucro Real", "Categoria": "Impostos s/ Consumo (PIS/COFINS/ISS/DAS)", "Valor": total_lr_con},
-        {"Regime": "Lucro Real", "Categoria": "Encargos s/ Folha (INSS)", "Valor": total_lr_enc},
-    ]
-    df_grafico = pd.DataFrame(dados_grafico)
-    fig = px.bar(df_grafico, x="Regime", y="Valor", color="Categoria", title="Divisão da Carga Tributária", text_auto=".2s")
-    fig.update_layout(barmode='stack', yaxis_title="Custo (R$)")
-    st.plotly_chart(fig, use_container_width=True)
-    
-    st.divider()
-    renderizar_detalhes_tributos(resultados)
-
-# ==========================================
-# ABA: PROJEÇÃO 12 MESES
-# ==========================================
-with tab_projecao:
-    st.subheader("📝 Preencha a Projeção (12 Meses)")
-    
-    col_proj1, col_proj2 = st.columns([2, 1])
-    with col_proj1:
-        st.markdown("Se você importou o PGDAS ou preencheu o histórico, pode usar os valores médios para projetar os próximos 12 meses automaticamente.")
-    with col_proj2:
-        opcao_projecao = st.selectbox(
-            "Cálculo de Projeção", 
-            ["Média (0% Crescimento)", "Taxa Padrão (5%)", "Taxa Padrão (10%)", "Taxa Padrão (15%)", "Taxa Personalizada"]
-        )
-        if opcao_projecao == "Média (0% Crescimento)":
-            taxa_crescimento = 0.0
-        elif opcao_projecao == "Taxa Padrão (5%)":
-            taxa_crescimento = 5.0
-        elif opcao_projecao == "Taxa Padrão (10%)":
-            taxa_crescimento = 10.0
-        elif opcao_projecao == "Taxa Padrão (15%)":
-            taxa_crescimento = 15.0
-        else:
-            taxa_crescimento = st.number_input("Taxa Personalizada (%)", value=0.0, step=1.0)
-        
-    if st.button("Aplicar Projeção Automática", use_container_width=True):
-        media_fat = (rbt12_inicial / 12) * (1 + taxa_crescimento/100) if rbt12_inicial > 0 else 0.0
-        media_folha = (folha12m_inicial / 12) * (1 + taxa_crescimento/100) if folha12m_inicial > 0 else 0.0
-        st.session_state["proj_fat"] = [media_fat] * 12
-        st.session_state["proj_folha"] = [media_folha] * 12
-        st.rerun()
-        
-    meses = [f"Mês {i}" for i in range(1, 13)]
-    df_initial = pd.DataFrame({
-        "Mês": meses,
-        "Faturamento Bruto": st.session_state.get("proj_fat", [0.0] * 12),
-        "Folha de Pagamento": st.session_state.get("proj_folha", [0.0] * 12),
-        "Despesas Dedutíveis (LR)": [0.0] * 12,
-        "Compras c/ Crédito PIS/COFINS": [0.0] * 12
-    })
-    
-    edited_df = st.data_editor(
-        df_initial, 
+    df_hist = pd.DataFrame(st.session_state.historico)
+    historico_editado = st.data_editor(
+        df_hist,
         use_container_width=True,
         hide_index=True,
+        num_rows="fixed",
         column_config={
-            "Faturamento Bruto": st.column_config.NumberColumn(format="R$ %.2f"),
-            "Folha de Pagamento": st.column_config.NumberColumn(format="R$ %.2f"),
-            "Despesas Dedutíveis (LR)": st.column_config.NumberColumn(format="R$ %.2f"),
-            "Compras c/ Crédito PIS/COFINS": st.column_config.NumberColumn(format="R$ %.2f")
-        }
+            "Competência": st.column_config.TextColumn(width="small"),
+            "Faturamento": st.column_config.NumberColumn(format="R$ %.2f", min_value=0.0),
+            "Folha": st.column_config.NumberColumn(format="R$ %.2f", min_value=0.0),
+            "Origem": st.column_config.TextColumn(disabled=True),
+        },
+        key="editor_historico",
     )
-    
-    if st.button("🚀 Executar/Salvar Simulação 12 Meses", type="primary", use_container_width=True, key="btn_12m"):
-        dados_input = []
-        for idx, row in edited_df.iterrows():
-            dados_input.append(DadosMes(
-                mes=idx + 1,
-                faturamento=float(row["Faturamento Bruto"]),
-                folha=float(row["Folha de Pagamento"]),
-                despesas_dedutiveis=float(row["Despesas Dedutíveis (LR)"]),
-                compras_credito=float(row["Compras c/ Crédito PIS/COFINS"])
-            ))
-        resultados = simular_12_meses(dados_input, config, rbt12_inicial, folha12m_inicial)
-        st.session_state['resultados_12m'] = resultados
-        st.session_state['dados_input_12m'] = dados_input
-        
-    if 'resultados_12m' in st.session_state:
-        resultados = st.session_state['resultados_12m']
-        exibir_resultados(resultados)
-        
-        st.divider()
-        renderizar_impacto_folha(resultados, config)
-        
-        st.divider()
-        excel_data = gerar_excel(resultados, st.session_state['dados_input_12m'])
+    st.session_state.historico = historico_editado.to_dict("records")
+
+    c1, c2, c3, c4 = st.columns(4)
+    rbt_hist = float(historico_editado["Faturamento"].sum())
+    folha_hist = float(historico_editado["Folha"].sum())
+    c1.metric("Receita dos 12 meses", reais(rbt_hist))
+    c2.metric("Folha dos 12 meses", reais(folha_hist))
+    c3.metric("Fator R histórico", f"{folha_hist / rbt_hist:.2%}" if rbt_hist else "—")
+    c4.metric("Média mensal", reais(rbt_hist / 12))
+    if any("estimada" in str(v).lower() for v in historico_editado["Origem"]):
+        st.info("A folha do período de apuração do PDF foi estimada pela média. Revise-a na tabela.")
+
+with tab_projecao:
+    st.subheader("Construa o cenário dos próximos 12 meses")
+    c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
+    with c1:
+        metodo = st.selectbox(
+            "Método de projeção",
+            [
+                "Sazonalidade (mesmo mês do ano anterior)",
+                "Média dos últimos 3 meses",
+                "Média dos últimos 12 meses",
+            ],
+        )
+    with c2:
+        crescimento = st.number_input("Crescimento anual (%)", -50.0, 200.0, 5.0, 1.0) / 100
+    with c3:
+        despesas_pct = st.number_input("Despesas LR (% receita)", 0.0, 100.0, 55.0, 1.0) / 100
+    with c4:
+        creditos_pct = st.number_input("Base créditos (% receita)", 0.0, 100.0, 10.0, 1.0) / 100
+
+    if st.button("Aplicar projeção a partir do histórico", type="secondary", use_container_width=True):
+        try:
+            st.session_state.projecao = gerar_projecao(
+                pd.DataFrame(st.session_state.historico),
+                metodo,
+                crescimento,
+                despesas_pct,
+                creditos_pct,
+            )
+        except Exception as exc:
+            st.error(f"Revise as competências e valores do histórico: {exc}")
+
+    if st.session_state.projecao is None:
+        st.info("Aplique um método de projeção para preencher os próximos 12 meses.")
+    else:
+        projecao_editada = st.data_editor(
+            st.session_state.projecao,
+            use_container_width=True,
+            hide_index=True,
+            num_rows="fixed",
+            column_config={
+                "Competência": st.column_config.TextColumn(width="small"),
+                "Faturamento": st.column_config.NumberColumn(format="R$ %.2f", min_value=0.0),
+                "Folha": st.column_config.NumberColumn(format="R$ %.2f", min_value=0.0),
+                "Despesas dedutíveis (LR)": st.column_config.NumberColumn(
+                    format="R$ %.2f", min_value=0.0
+                ),
+                "Base de aquisições com crédito": st.column_config.NumberColumn(
+                    format="R$ %.2f", min_value=0.0
+                ),
+            },
+            key="editor_projecao",
+        )
+        st.session_state.projecao = projecao_editada
+        st.caption(
+            "Despesas e créditos são premissas críticas para o Lucro Real. Ajuste os valores com "
+            "base na contabilidade e na documentação fiscal."
+        )
+        if st.button("Simular e salvar cenário", type="primary", use_container_width=True):
+            dados = [
+                DadosMes(
+                    mes=i + 1,
+                    competencia=str(row["Competência"]),
+                    faturamento=float(row["Faturamento"]),
+                    folha=float(row["Folha"]),
+                    despesas_dedutiveis=float(row["Despesas dedutíveis (LR)"]),
+                    compras_credito=float(row["Base de aquisições com crédito"]),
+                )
+                for i, (_, row) in enumerate(projecao_editada.iterrows())
+            ]
+            hist_df = pd.DataFrame(st.session_state.historico).tail(12)
+            resultados = simular_12_meses(
+                dados,
+                config,
+                rbt12_inicial=float(hist_df["Faturamento"].sum()),
+                folha12m_inicial=float(hist_df["Folha"].sum()),
+                historico_faturamento=hist_df["Faturamento"].astype(float).tolist(),
+                historico_folha=hist_df["Folha"].astype(float).tolist(),
+            )
+            st.session_state.resultados = resultados
+            st.session_state.dados_simulados = dados
+            st.session_state.config_simulada = config
+            totais_salvar = {
+                "Simples Nacional": sum(r.total_sn for r in resultados),
+                "Lucro Presumido": sum(r.total_lp for r in resultados),
+                "Lucro Real": sum(r.total_lr for r in resultados),
+            }
+            vencedor_salvar = min(totais_salvar, key=totais_salvar.get)
+            salvar_simulacao(
+                vencedor_salvar,
+                totais_salvar["Simples Nacional"],
+                totais_salvar["Lucro Presumido"],
+                totais_salvar["Lucro Real"],
+                {"competencias": [r.competencia for r in resultados]},
+            )
+            st.success("Cenário calculado e registrado. Abra a aba “Resultado e Excel”.")
+
+with tab_resultado:
+    if "resultados" not in st.session_state:
+        st.info("Calcule um cenário na aba de projeção para visualizar a comparação.")
+    else:
+        resultados = st.session_state.resultados
+        df_result = dataframe_resultados(resultados)
+        totais = {
+            "Simples Nacional": float(df_result["Simples Nacional"].sum()),
+            "Lucro Presumido": float(df_result["Lucro Presumido"].sum()),
+            "Lucro Real": float(df_result["Lucro Real"].sum()),
+        }
+        ranking = sorted(totais.items(), key=lambda item: item[1])
+        faturamento_total = float(df_result["Faturamento"].sum())
+        economia = ranking[1][1] - ranking[0][1]
+
+        st.subheader(f"Melhor resultado projetado: {ranking[0][0]}")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Simples Nacional", reais(totais["Simples Nacional"]))
+        c2.metric("Lucro Presumido", reais(totais["Lucro Presumido"]))
+        c3.metric("Lucro Real", reais(totais["Lucro Real"]))
+        c4.metric("Economia vs. 2º", reais(economia))
+
+        grafico = df_result.melt(
+            id_vars=["Competência"],
+            value_vars=["Simples Nacional", "Lucro Presumido", "Lucro Real"],
+            var_name="Regime",
+            value_name="Carga tributária",
+        )
+        fig = px.line(
+            grafico,
+            x="Competência",
+            y="Carga tributária",
+            color="Regime",
+            markers=True,
+            color_discrete_map={
+                "Simples Nacional": "#0f766e",
+                "Lucro Presumido": "#2563eb",
+                "Lucro Real": "#f59e0b",
+            },
+        )
+        fig.update_layout(
+            title="Carga tributária mês a mês",
+            yaxis_tickprefix="R$ ",
+            hovermode="x unified",
+            legend_title="",
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(255,255,255,1)",
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        col_esq, col_dir = st.columns(2)
+        with col_esq:
+            fig_r = go.Figure()
+            fig_r.add_trace(
+                go.Bar(
+                    x=df_result["Competência"],
+                    y=df_result["Fator R"],
+                    marker_color=[
+                        "#0f766e" if valor >= 0.28 else "#dc2626"
+                        for valor in df_result["Fator R"]
+                    ],
+                    name="Fator R",
+                )
+            )
+            fig_r.add_hline(y=0.28, line_dash="dash", line_color="#0f172a")
+            fig_r.update_layout(
+                title="Fator R e limite de 28%",
+                yaxis_tickformat=".0%",
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="white",
+            )
+            st.plotly_chart(fig_r, use_container_width=True)
+        with col_dir:
+            aliquotas = pd.DataFrame(
+                {
+                    "Regime": list(totais),
+                    "Alíquota efetiva": [
+                        valor / faturamento_total if faturamento_total else 0
+                        for valor in totais.values()
+                    ],
+                }
+            )
+            fig_a = px.bar(
+                aliquotas,
+                x="Regime",
+                y="Alíquota efetiva",
+                color="Regime",
+                text_auto=".2%",
+                color_discrete_sequence=["#0f766e", "#2563eb", "#f59e0b"],
+            )
+            fig_a.update_layout(
+                title="Alíquota efetiva no horizonte",
+                showlegend=False,
+                yaxis_tickformat=".0%",
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="white",
+            )
+            st.plotly_chart(fig_a, use_container_width=True)
+
+        st.markdown("#### Apuração comparativa por competência")
+        st.dataframe(
+            df_result,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Faturamento": st.column_config.NumberColumn(format="R$ %.2f"),
+                "RBT12": st.column_config.NumberColumn(format="R$ %.2f"),
+                "Fator R": st.column_config.NumberColumn(format="%.2f%%"),
+                "Alíquota SN": st.column_config.NumberColumn(format="%.2f%%"),
+                "Simples Nacional": st.column_config.NumberColumn(format="R$ %.2f"),
+                "Lucro Presumido": st.column_config.NumberColumn(format="R$ %.2f"),
+                "Lucro Real": st.column_config.NumberColumn(format="R$ %.2f"),
+                "Economia para o 2º": st.column_config.NumberColumn(format="R$ %.2f"),
+            },
+        )
+
+        observacoes = sorted({r.sn_observacao for r in resultados if r.sn_observacao})
+        for observacao in observacoes:
+            st.warning(observacao)
+
+        excel = gerar_excel(
+            resultados,
+            st.session_state.dados_simulados,
+            st.session_state.config_simulada,
+            st.session_state.historico,
+            st.session_state.metadados_pgdas,
+        )
         st.download_button(
-            label="📥 Baixar Excel Detalhado (12 Meses)",
-            data=excel_data,
-            file_name="simulacao_tributaria_12m.xlsx",
+            "Baixar Excel completo e auditável",
+            data=excel,
+            file_name="simulacao_tributaria_mensal.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             type="primary",
             use_container_width=True,
-            key="dl_12m"
         )
-        
-        with st.expander("📂 Histórico de Simulações Salvas"):
-            historico = listar_simulacoes()
-            if historico:
-                df_hist = pd.DataFrame(historico, columns=["ID", "Data", "Vencedor", "Custo SN", "Custo LP", "Custo LR"])
-                for col in ["Custo SN", "Custo LP", "Custo LR"]:
-                    df_hist[col] = df_hist[col].apply(lambda x: f"R$ {x:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
-                st.dataframe(df_hist, use_container_width=True, hide_index=True)
-            else:
-                st.info("Nenhuma simulação salva ainda.")
 
-# ==========================================
-# ABA: SIMULAÇÃO MENSAL
-# ==========================================
-with tab_mensal:
-    st.subheader("📝 Preencha os dados de 1 Mês")
-    
-    col_f, col_fp = st.columns(2)
-    with col_f:
-        faturamento_m = st.number_input("Faturamento Bruto (Mês)", value=0.0, step=1000.0, key="fat_m")
-    with col_fp:
-        folha_m = st.number_input("Folha de Pagamento (Mês)", value=0.0, step=1000.0, key="folha_m")
-        
-    col_d, col_c = st.columns(2)
-    with col_d:
-        despesas_m = st.number_input("Despesas Dedutíveis LR (Mês)", value=0.0, step=1000.0, key="desp_m")
-    with col_c:
-        compras_m = st.number_input("Compras c/ Crédito PIS/COFINS (Mês)", value=0.0, step=1000.0, key="comp_m")
-        
-    if st.button("⚡ Executar Simulação Mensal", type="primary", use_container_width=True, key="btn_1m"):
-        dados_input_mensal = [DadosMes(
-            mes=1,
-            faturamento=faturamento_m,
-            folha=folha_m,
-            despesas_dedutiveis=despesas_m,
-            compras_credito=compras_m
-        )]
-        
-        resultados_m = simular_12_meses(dados_input_mensal, config, rbt12_inicial, folha12m_inicial)
-        st.session_state['resultados_1m'] = resultados_m
-        
-    if 'resultados_1m' in st.session_state:
-        resultados_m = st.session_state['resultados_1m']
-        exibir_resultados(resultados_m)
-        
-        st.divider()
-        renderizar_impacto_folha(resultados_m, config)
+        with st.expander("Histórico de cenários salvos"):
+            historico_db = listar_simulacoes()
+            if historico_db:
+                df_db = pd.DataFrame(
+                    historico_db,
+                    columns=["ID", "Data", "Regime vencedor", "Simples", "Presumido", "Real"],
+                )
+                st.dataframe(
+                    df_db,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Simples": st.column_config.NumberColumn(format="R$ %.2f"),
+                        "Presumido": st.column_config.NumberColumn(format="R$ %.2f"),
+                        "Real": st.column_config.NumberColumn(format="R$ %.2f"),
+                    },
+                )
+            else:
+                st.caption("Nenhum cenário salvo.")
+
+        with st.expander("Escopo e limitações"):
+            st.markdown(
+                """
+                - Lucro Presumido e Lucro Real são tratados com fechamento trimestral.
+                - O adicional do IRPJ é calculado sobre a parcela que excede R$ 20 mil por mês
+                  do período e aparece no último mês do trimestre.
+                - Para 2026, o acréscimo de 10% nos percentuais de presunção é aplicado à receita
+                  trimestral acima de R$ 1,25 milhão, observada a vigência específica da CSLL.
+                - Créditos de PIS/Cofins são limitados ao débito no modelo e dependem de
+                  elegibilidade/documentação na apuração real.
+                - O resultado não substitui parecer contábil ou fiscal.
+                """
+            )
