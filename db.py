@@ -1,8 +1,9 @@
 import sqlite3
 import json
 from datetime import datetime
+from pathlib import Path
 
-DB_PATH = "simulacoes.db"
+DB_PATH = Path(__file__).with_name("simulacoes.db")
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -25,7 +26,7 @@ def salvar_simulacao(vencedor: str, custo_sn: float, custo_lp: float, custo_lr: 
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     data_atual = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    detalhes_str = json.dumps(detalhes)
+    detalhes_str = json.dumps(detalhes, ensure_ascii=False)
     
     cursor.execute('''
         INSERT INTO simulacoes (data_simulacao, regime_vencedor, custo_simples, custo_presumido, custo_real, detalhes_json)

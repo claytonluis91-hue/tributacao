@@ -2,3 +2,5 @@ __pycache__/
 *.pyc
 simulacoes.db
 .vscode/
+outputs/
+teste_exportacao.xlsx
